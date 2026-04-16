@@ -1,0 +1,646 @@
+import streamlit as st
+import google.generativeai as genai
+import json, requests, base64, os, time, re, zipfile, io, sqlite3, ssl, threading, shutil, argparse, sys, subprocess, importlib.util, hashlib
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import copy, uuid, ast, tempfile
+from pydantic import BaseModel, ValidationError
+from typing import List
+from fastapi import FastAPI, HTTPException, Header, Request
+import uvicorn
+from collections import defaultdict
+
+==================== CONFIG ====================
+
+ATLAS_ROOT = Path.home() / ".atlas"
+PROJECTS_DIR = ATLAS_ROOT / "projects"
+TASK_DB = ATLAS_ROOT / "atlas_tasks.db"
+API_KEY = os.getenv("GEMINI_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "")
+OMNIFORGE_API_KEY = os.getenv("OMNIFORGE_API_KEY", "changeme")
+
+MAX_FILE_SIZE_B = 8 * 1024 * 1024 # 8MB
+MAX_FILES_PER_REQ = 60
+GITHUB_API_DELAY = 0.12
+REQUEST_TIMEOUT = 90
+MAX_DISK_USAGE_MB = 500
+MAX_PROJECT_AGE_DAYS = 7
+DB_BUSY_TIMEOUT_MS = 5000
+RATE_LIMIT_GEN = 10 # per minute per IP
+RATE_LIMIT_BUILD = 3 # per minute per IP
+API_DAILY_QUOTA = 100 # generations per key
+
+RECIPE_WHITELIST = {"python3", "kivy", "kivymd", "requests", "pillow", "plyer", "google-generativeai"}
+MOBILE_STDLIB = {"kivy", "kivymd", "plyer", "jnius", "pyjnius", "android"}
+ANDROID_BANNED_PATTERNS = [r'size\s*=\s*(', r'pos\s*=\s*(', r'FloatLayout\b', r'numpy', r'pandas', r'cv2']
+AST_BANNED_CALLS = {"eval", "exec", "compile", "import"}
+AST_BANNED_ATTRS = {("os", "system"), ("os", "popen"), ("os", "spawn"), ("subprocess", "Popen"), ("subprocess", "call"), ("subprocess", "run")}
+JAILBREAK_PATTERNS = [r"ignore (previous|all) instructions", r"system prompt", r"reveal.prompt", r"dan mode", r"developer mode", r"unfiltered", r"bypass"]
+ILLEGAL_CHARS = r'[<>:"|?\x00-\x1F]'
+RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "COM1", "LPT1"}
+
+PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+GITHUB_LOCK = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=4)
+
+In-memory rate limiter: {ip: [timestamps]}
+
+RATE_LIMITER = defaultdict(list)
+RATE_LOCK = threading.Lock()
+
+BUILD_YML = """name: Build Kivy APK - Atlas Titan Hardened
+on:
+workflow_dispatch:
+push:
+branches: [ src ]
+jobs:
+build:
+runs-on: ubuntu-24.04
+timeout-minutes: 45
+steps:
+- uses: actions/checkout@v4
+with: {ref: src}
+- name: Install system dependencies
+run: |
+sudo apt-get update
+sudo apt-get install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 cmake libffi-dev libssl-dev
+sudo apt-get install -y libltdl-dev build-essential ccache libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm libncurses5-dev libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev libportmidi-dev libswscale-dev libavformat-dev libavcodec-dev
+- uses: digreatbrian/buildozer-action@v2
+with:
+work-dir:.
+buildozer-cmd: buildozer android debug
+buildozer-version: stable
+- uses: actions/upload-artifact@v4
+with:
+name: app-apk
+path: bin/*.apk
+retention-days: 7
+"""
+
+DOWNLOADER_PY = """
+import os, requests, time
+from pathlib import Path
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def ensure_assets(asset_map: dict):
+retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["HEAD", "GET"])
+session = requests.Session()
+session.verify = True
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount('https://', adapter)
+session.mount('http://', adapter)
+for local_path, url in asset_map.items():
+p = Path(local_path)
+p.parent.mkdir(parents=True, exist_ok=True)
+if not p.exists():
+try:
+r = session.get(url, timeout=(5, 60))
+r.raise_for_status()
+p.write_bytes(r.content)
+except Exception as e:
+print(f"Atlas Asset Error: {e}")
+"""
+
+SYSTEM = """
+You are OMNIFORGE ATLAS v7.3. You build ANY software with ZERO exceptions.
+CRITICAL OUTPUT RULE: You MUST respond with ONLY a single JSON object. No markdown, no prose.
+JSON Schema: {"files": [{"path": "path/to/file.ext", "content": "full file content"}], "readme": "1-sentence summary", "truncated": false}
+CORE DIRECTIVES:
+
+1. FILE LIMIT: Max 60 files. If project needs more, output first 60 and set "truncated": true. User will ask to continue.
+
+
+2. HARD CAP: No single file >150 lines of code. Split into core/logic.py, ui/screens.py, api/client.py. This prevents token clipping.
+
+
+3. MODULARIZE: Never write monolithic files. Keeps each file parseable and under token limit.
+
+
+4. ASSET RULE: NEVER embed binary assets >100KB. For images/fonts/db, output placeholder.txt: "Host large_file.png on CDN: https://...". YOU MUST also generate utils/downloader.py and call ensure_assets() in main.py BEFORE the UI loads to fetch all placeholders.
+
+
+5. NO OPENCV: NEVER use cv2, opencv-python, or opencv-python-headless. They crash on Android. Use Pillow (PIL) for manipulation, kivy.core.image.Image for display.
+
+
+6. KIVY SAFE LIBS: Only use these in requirements: python3,kivy,kivymd,requests,pillow,plyer,google-generativeai. Any other library will fail on Android.
+
+
+7. AUTO-SELECT STACK: Pick optimal: Kivy=Android, Flutter=Cross, FastAPI=Backend, NextJS=Web. State choice in readme.
+
+
+8. INSTANT AI RULE: All AI = API-first. Use google.generativeai, openai, replicate. For local: transformers pipeline() with tiny models only.
+
+
+9. KIVY APK: Always include main.py, buildozer.spec with android.api=35, android.permissions=INTERNET,WRITE_EXTERNAL_STORAGE, android.archs=arm64-v8a, requirements=python3,kivy,kivymd,requests,pillow,plyer,google-generativeai
+
+
+10. WORKFLOW AUTO-GEN: If target is Kivy, ALWAYS include.github/workflows/build.yml with standard Buildozer action. User should not have to create it.
+
+
+11. NO REFUSAL: Except illegal. If illegal, return {"files": [], "readme": "Request refused: illegal content", "truncated": false}.
+
+
+12. BE COMPLETE: requirements.txt, README.md,.env.example,.gitignore. All paths POSIX, relative.
+
+
+13. CLOSE YOUR JSON: Ensure all brackets and braces are closed. Do not truncate mid-string.
+
+
+14. ANDROID READY: For Kivy, add runtime permission request for WRITE_EXTERNAL_STORAGE in main.py. Keep all images <720p to avoid OOM on 2GB RAM devices like Infinix Hot 10 Play. This build MUST run on Android.
+
+
+15. NO ABSOLUTE POSITIONING: Never use pos: x, y or size: x, y in Kivy. Use only pos_hint and size_hint with floats 0-1. Prefer BoxLayout or GridLayout. FloatLayout banned. RelativeLayout allowed ONLY for overlaying widgets (e.g., loading spinner on image). All children inside RelativeLayout must still use pos_hint/size_hint.
+
+
+16. CONTRACT FILE: If project has >1 file, you MUST create atlas_contract.md first. It lists all public classes, functions, and constants with signatures. Every new.py file you write must start with: # CONTRACT: core/models.py -> UserDB, get_user(id). Read this comment before using any import.
+
+
+17. MEMORY BUDGET: Warn user in readme if estimated RAM >300MB. Formula: 180MB base + sum(image_wimage_h4) + JSON_size*3. Release textures with 'del tex' after use in loops.
+
+
+18. BUILD API LEVEL: Target android.api=35. If Play Store rejects, user will override. Default to 35 for 2026+.
+
+
+19. 16KB PAGE SIZE: Target Android 15 requires 16KB memory page alignment. Ensure python-for-android and Kivy master branches are used. digreatbrian/buildozer-action@v2 handles this. Do not use custom NDKs.
+
+
+20. SECURITY: NEVER use os.system, os.popen, subprocess.*, eval, exec, import, or open() for writing outside assets/. os.path and sys.version are allowed. All file IO must be in assets/ or user_data/.
+"""
+
+
+
+==================== MODELS ====================
+
+class AtlasFile(BaseModel):
+path: str
+content: str
+
+class AtlasOutput(BaseModel):
+files: List[AtlasFile]
+readme: str
+truncated: bool
+
+==================== STORAGE + DB ====================
+
+def db_connect():
+conn = sqlite3.connect(TASK_DB, timeout=30, check_same_thread=False)
+conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
+return conn
+
+def init_db():
+conn = db_connect()
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, msg TEXT, ts REAL, project_id TEXT)")
+conn.execute("CREATE TABLE IF NOT EXISTS locks (project_id TEXT PRIMARY KEY, ts REAL)")
+conn.execute("CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, ts REAL, ip TEXT, key_hash TEXT, endpoint TEXT, status INTEGER)")
+conn.commit()
+conn.close()
+
+def db_lock_project(project_id: str):
+conn = db_connect()
+with conn: conn.execute("REPLACE INTO locks VALUES (?,?)", (project_id, time.time()))
+conn.close()
+
+def db_unlock_project(project_id: str):
+conn = db_connect()
+with conn: conn.execute("DELETE FROM locks WHERE project_id=?", (project_id,))
+conn.close()
+
+def is_project_locked(project_id: str) -> bool:
+conn = db_connect()
+cur = conn.execute("SELECT 1 FROM locks WHERE project_id=?", (project_id,))
+locked = cur.fetchone() is not None
+conn.close()
+return locked
+
+def write_task_state(task_id: str, status: str, msg: str, project_id: str = None):
+init_db()
+for attempt in range(3):
+try:
+conn = db_connect()
+with conn: conn.execute("REPLACE INTO tasks VALUES (?,?,?,?,?)", (task_id, status, msg, time.time(), project_id))
+conn.close()
+return
+except sqlite3.OperationalError as e:
+if "locked" in str(e) and attempt < 2: time.sleep(0.1 * (2 ** attempt))
+else: raise
+
+def read_task_state(task_id: str) -> dict:
+init_db()
+conn = db_connect()
+cur = conn.execute("SELECT status, msg, ts, project_id FROM tasks WHERE id=?", (task_id,))
+row = cur.fetchone()
+conn.close()
+return {"status": row[0], "msg": row[1], "ts": row[2], "project_id": row[3]} if row else {"status": "idle", "msg": "", "ts": 0}
+
+def audit_log(ip: str, key_hash: str, endpoint: str, status: int):
+init_db()
+conn = db_connect()
+with conn: conn.execute("INSERT INTO audit (ts, ip, key_hash, endpoint, status) VALUES (?,?,?,?,?)", (time.time(), ip, key_hash, endpoint, status))
+conn.close()
+
+def check_api_quota(key_hash: str) -> bool:
+conn = db_connect()
+day_ago = time.time() - 86400
+cur = conn.execute("SELECT COUNT(*) FROM audit WHERE key_hash=? AND endpoint='/generate' AND ts>?", (key_hash, day_ago))
+count = cur.fetchone()[0]
+conn.close()
+return count < API_DAILY_QUOTA
+
+def cleanup_old_projects():
+init_db()
+try:
+total_size = sum(f.stat().st_size for f in PROJECTS_DIR.rglob('') if f.is_file())
+if total_size > MAX_DISK_USAGE_MB * 1024 * 1024:
+projects = sorted([p for p in PROJECTS_DIR.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime)
+while total_size > MAX_DISK_USAGE_MB * 1024 * 0.8 and len(projects) > 5:
+old = projects.pop(0)
+if is_project_locked(old.name): continue
+total_size -= sum(f.stat().st_size for f in old.rglob('') if f.is_file())
+shutil.rmtree(old)
+now = time.time()
+for p in PROJECTS_DIR.iterdir():
+if p.is_dir() and not is_project_locked(p.name):
+if (now - p.stat().st_mtime) < 300: continue
+if (now - p.stat().st_mtime) > MAX_PROJECT_AGE_DAYS * 86400: shutil.rmtree(p)
+except Exception as e: print(f"Cleanup error: {e}")
+
+def save_project_files(project_id: str, files: list[AtlasFile]):
+cleanup_old_projects()
+proj_dir = PROJECTS_DIR / project_id
+if proj_dir.exists(): shutil.rmtree(proj_dir)
+proj_dir.mkdir()
+for f in files:
+(proj_dir / f.path).parent.mkdir(parents=True, exist_ok=True)
+(proj_dir / f.path).write_text(f.content, encoding='utf-8')
+
+def load_project_files(project_id: str) -> list[AtlasFile]:
+proj_dir = PROJECTS_DIR / project_id
+if not proj_dir.exists(): return []
+files = []
+for p in proj_dir.rglob("*"):
+if p.is_file():
+rel_path = p.relative_to(proj_dir).as_posix()
+files.append(AtlasFile(path=rel_path, content=p.read_text(encoding='utf-8')))
+return files
+
+==================== RATE LIMITER ====================
+
+def check_rate_limit(ip: str, limit: int) -> bool:
+with RATE_LOCK:
+now = time.time()
+timestamps = RATE_LIMITER[ip]
+timestamps = [t for t in timestamps if now - t < 60]
+RATE_LIMITER[ip] = timestamps
+if len(timestamps) >= limit: return False
+timestamps.append(now)
+return True
+
+==================== VALIDATORS ====================
+
+def is_jailbreak(text: str) -> bool:
+return any(re.search(p, text, re.I) for p in JAILBREAK_PATTERNS)
+
+def sanitize_path(path: str) -> str | None:
+p = Path(path.strip().lstrip("/\"))
+if ".." in p.parts or p.is_absolute(): return None
+if re.search(ILLEGAL_CHARS, str(p)): return None
+if p.stem.upper() in RESERVED_NAMES: return None
+return str(p.as_posix())
+
+def repair_and_validate_json(raw: str, model_obj, attempt: int = 0) -> AtlasOutput | None:
+if attempt > 1: return None
+try:
+data = json.loads(raw)
+return AtlasOutput(**data)
+except (json.JSONDecodeError, ValidationError) as e:
+if attempt == 0:
+fix_prompt = f"Your last output was invalid JSON. Pydantic error: {e}. Return ONLY the corrected JSON object. Original:\n{raw[:4000]}"
+try:
+res = model_obj.generate_content(fix_prompt)
+return repair_and_validate_json(res.text, model_obj, attempt + 1)
+except: pass
+return None
+
+def ast_security_scan(code: str) -> tuple[bool, str]:
+try:
+tree = ast.parse(code)
+for node in ast.walk(tree):
+if isinstance(node, ast.Call):
+if isinstance(node.func, ast.Name) and node.func.id in AST_BANNED_CALLS:
+return False, f"Banned call: {node.func.id}()"
+if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+if (node.func.value.id, node.func.attr) in AST_BANNED_ATTRS:
+return False, f"Banned call: {node.func.value.id}.{node.func.attr}()"
+except SyntaxError as e:
+return False, f"Syntax error: {e}"
+return True, "OK"
+
+def validate_imports(files: list[AtlasFile]) -> tuple[bool, str]:
+local_modules = {Path(f.path).stem for f in files if f.path.endswith(".py")}
+for f in files:
+if f.path.endswith(".py"):
+try:
+tree = ast.parse(f.content)
+for node in ast.walk(tree):
+mod = None
+if isinstance(node, ast.Import):
+for alias in node.names: mod = alias.name.split('.')[0]
+elif isinstance(node, ast.ImportFrom) and node.module:
+mod = node.module.split('.')[0]
+if mod and mod not in RECIPE_WHITELIST and mod not in local_modules and mod not in MOBILE_STDLIB:
+if importlib.util.find_spec(mod) is None:
+return False, f"{f.path}: unknown import '{mod}'"
+except SyntaxError: pass
+return True, "OK"
+
+def validate_python_files(files: list[AtlasFile]) -> tuple[bool, str]:
+for f in files:
+if f.path.endswith(".py"):
+if len(f.content.splitlines()) > 150:
+return False, f"File {f.path} exceeds 150 line limit."
+ok, msg = ast_security_scan(f.content)
+if not ok: return False, f"Security fail in {f.path}: {msg}"
+return validate_imports(files)
+
+def validate_contract(files: list[AtlasFile]) -> tuple[bool, str]:
+if len(files) < 2: return True, "OK"
+contract = next((f for f in files if f.path == "atlas_contract.md"), None)
+if not contract: return False, "Multi-file project missing atlas_contract.md."
+py_files = [f for f in files if f.path.endswith(".py") and f.path!= "main.py"]
+missing = [f.path for f in py_files if "# CONTRACT:" not in f.content[:200]]
+if missing: return False, f"Files missing contract header: {missing}."
+return True, "OK"
+
+def validate_android_rules(files: list[AtlasFile]) -> tuple[bool, str]:
+for f in files:
+if f.path.endswith(".py"):
+for pattern in ANDROID_BANNED_PATTERNS:
+if re.search(pattern, f.content):
+return False, f"Android ban: Found '{pattern}' in {f.path}."
+return True, "OK"
+
+def validate_assets(files: list[AtlasFile]) -> list[AtlasFile]:
+placeholders = [f for f in files if f.path.endswith("placeholder.txt")]
+if not placeholders: return files
+has_downloader = any(f.path == "utils/downloader.py" for f in files)
+if not has_downloader:
+asset_map = {}
+for p in placeholders:
+url_match = re.search(r'https?://\S+', p.content)
+if url_match:
+local_name = p.path.replace("placeholder.txt", "asset.bin")
+asset_map[local_name] = url_match.group(0)
+downloader_content = DOWNLOADER_PY + f"\nASSET_MAP = {json.dumps(asset_map, indent=4)}\n\nif name!= 'main':\n ensure_assets(ASSET_MAP)\n"
+files.append(AtlasFile(path="utils/downloader.py", content=downloader_content))
+main_file = next((f for f in files if f.path == "main.py"), None)
+if main_file and "ensure_assets(ASSET_MAP)" not in main_file.content: # FIXED: idempotent
+main_file.content = "from utils.downloader import ensure_assets, ASSET_MAP\nensure_assets(ASSET_MAP)\n" + main_file.content
+return files
+
+def run_all_validators(files: list[AtlasFile]) -> tuple[bool, str]:
+for validator in [validate_python_files, validate_contract, validate_android_rules]:
+ok, msg = validator(files)
+if not ok: return False, msg
+return True, "OK"
+
+==================== SANDBOX ====================
+
+def sandbox_test(files: list[AtlasFile], project_dir: Path) -> tuple[bool, str]:
+main_py = next((f for f in files if f.path == "main.py"), None)
+if not main_py: return True, "No main.py to test"
+for f in files:
+p = project_dir / f.path
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(f.content, encoding='utf-8')
+env = os.environ.copy()
+env.update({"KIVY_WINDOW": "dummy", "KIVY_NO_ARGS": "1", "KIVY_NO_FILELOG": "1", "KIVY_NO_CONSOLELOG": "1"})
+test_cmd = [sys.executable, "-I", "-c", "import main; print('Atlas: Import OK')"]
+try:
+result = subprocess.run(test_cmd, cwd=project_dir, env=env, capture_output=True, text=True, timeout=5)
+if result.returncode!= 0:
+return False, f"Sandbox failed:\n{result.stderr[-1000:]}"
+if "Atlas: Import OK" not in result.stdout:
+return False, "Sandbox: main.py did not import cleanly"
+except subprocess.TimeoutExpired:
+return False, "Sandbox: import main.py hung >5s"
+except Exception as e:
+return False, f"Sandbox error: {e}"
+return True, "OK"
+
+==================== GITHUB ====================
+
+def github_push_tree_task(task_id: str, files: list[AtlasFile], repo: str, token: str, project_id: str):
+db_lock_project(project_id)
+def update_status(status, msg):
+write_task_state(task_id, status, msg, project_id)
+update_status("running", "Initializing...")
+headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+branch = "src"
+try:
+for attempt in range(3): # FIXED: retry logic
+try:
+ref_url = f"https://api.github.com/repos/{repo}/git/refs/heads/{branch}"
+r_ref = requests.get(ref_url, headers=headers, timeout=REQUEST_TIMEOUT)
+if r_ref.status_code == 404:
+default_branch = requests.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=REQUEST_TIMEOUT).json()["default_branch"]
+base_sha = requests.get(f"https://api.github.com/repos/{repo}/git/refs/heads/{default_branch}", headers=headers, timeout=REQUEST_TIMEOUT).json()["object"]["sha"]
+requests.post(f"https://api.github.com/repos/{repo}/git/refs", headers=headers, json={"ref": f"refs/heads/{branch}", "sha": base_sha}, timeout=REQUEST_TIMEOUT)
+parent_sha = base_sha
+else:
+parent_sha = r_ref.json()["object"]["sha"]
+commit_obj = requests.get(f"https://api.github.com/repos/{repo}/git/commits/{parent_sha}", headers=headers, timeout=REQUEST_TIMEOUT).json()
+base_tree_sha = commit_obj["tree"]["sha"]
+tree_items = []
+skipped = []
+critical_files = {"main.py", "buildozer.spec", "atlas_contract.md"}
+for f in files:
+safe_path = sanitize_path(f.path) # FIXED: sanitize
+if not safe_path:
+skipped.append(f"{f.path} - illegal path")
+if f.path in critical_files: raise Exception(f"Critical file {f.path} has illegal path. Aborting.")
+continue
+if len(f.content.encode()) > MAX_FILE_SIZE_B:
+skipped.append(f"{safe_path} - exceeds 8MB limit")
+if f.path in critical_files: raise Exception(f"Critical file {f.path} too large. Aborting.")
+continue
+tree_items.append({"path": safe_path, "mode": "100644", "type": "blob", "content": f.content})
+if not tree_items: raise Exception(f"No valid files. Skipped: {skipped}")
+update_status("running", "Creating Git tree...")
+tree_res = requests.post(f"https://api.github.com/repos/{repo}/git/trees", headers=headers, json={"base_tree": base_tree_sha, "tree": tree_items}, timeout=REQUEST_TIMEOUT)
+tree_res.raise_for_status()
+new_tree_sha = tree_res.json()["sha"]
+update_status("running", "Creating commit...")
+commit_res = requests.post(f"https://api.github.com/repos/{repo}/git/commits", headers=headers, json={"message": f"Atlas: {len(tree_items)} files", "tree": new_tree_sha, "parents": [parent_sha]}, timeout=REQUEST_TIMEOUT)
+commit_res.raise_for_status()
+new_commit_sha = commit_res.json()["sha"]
+update_status("running", "Updating branch ref...")
+current_ref = requests.get(ref_url, headers=headers, timeout=REQUEST_TIMEOUT).json()
+if current_ref["object"]["sha"]!= parent_sha: raise Exception("409 Conflict")
+update_res = requests.patch(ref_url, headers=headers, json={"sha": new_commit_sha}, timeout=REQUEST_TIMEOUT)
+update_res.raise_for_status()
+verify = requests.get(f"https://api.github.com/repos/{repo}/git/trees/{new_tree_sha}", headers=headers, timeout=REQUEST_TIMEOUT)
+if verify.json()["sha"]!= new_tree_sha: raise Exception("Tree SHA mismatch after push. Rollback.")
+update_status("running", "Triggering workflow...")
+wf_url = f"https://api.github.com/repos/{repo}/actions/workflows/build.yml/dispatches"
+wf_res = requests.post(wf_url, headers=headers, json={"ref": branch}, timeout=REQUEST_TIMEOUT)
+if wf_res.status_code == 403: raise Exception("Workflow dispatch 403: Token lacks 'workflow' scope")
+wf_res.raise_for_status()
+msg = f"https://github.com/{repo}/actions"
+if skipped: msg += f"\nWarning: Skipped files: {'; '.join(skipped)}"
+update_status("done", msg)
+break # Success
+except Exception as e:
+if "409 Conflict" in str(e) and attempt < 2:
+time.sleep(0.5 * (2 ** attempt)) # Exponential backoff
+continue
+else:
+raise
+except Exception as e:
+update_status("error", str(e))
+finally:
+db_unlock_project(project_id)
+
+==================== GENERATOR ====================
+
+genai.configure(api_key=API_KEY)
+generation_config = genai.GenerationConfig(response_mime_type="application/json", max_output_tokens=8192)
+model = genai.GenerativeModel('gemini-1.5-pro', system_instruction=SYSTEM, generation_config=generation_config)
+
+def generate_project(history: list) -> AtlasOutput | None:
+res = model.generate_content(history)
+return repair_and_validate_json(res.text, model)
+
+def compress_history(history: list) -> list:
+if len(history) <= 2: return history
+compressed = []
+for i, msg in enumerate(history):
+if i >= len(history) - 2:
+compressed.append(msg)
+else:
+compressed.append({"role": msg["role"], "parts": [msg["content"][:200]]})
+return compressed
+
+==================== FASTAPI ====================
+
+app = FastAPI(title="OmniForge API")
+
+def get_client_ip(request: Request):
+return request.client.host if request.client else "unknown"
+
+def verify_api_key_dep(x_api_key: str = Header(...)):
+if x_api_key!= OMNIFORGE_API_KEY:
+raise HTTPException(status_code=403, detail="Invalid API Key")
+return hashlib.sha256(x_api_key.encode()).hexdigest()
+
+@app.post("/v1/projects/{project_id}/generate")
+def api_generate(project_id: str, prompt: str, mode: str = "Build", target: str = "Auto-Best", request: Request = None, x_api_key: str = Header(...)):
+key_hash = verify_api_key_dep(x_api_key)
+ip = get_client_ip(request)
+if not check_rate_limit(f"{ip}_gen", RATE_LIMIT_GEN):
+audit_log(ip, key_hash, "/generate", 429)
+raise HTTPException(status_code=429, detail="Rate limit exceeded")
+if not check_api_quota(key_hash):
+audit_log(ip, key_hash, "/generate", 429)
+raise HTTPException(status_code=429, detail="Daily quota exceeded")
+if is_project_locked(project_id):
+audit_log(ip, key_hash, "/generate", 409)
+raise HTTPException(status_code=409, detail="Project is locked (build in progress)")
+if is_jailbreak(prompt):
+audit_log(ip, key_hash, "/generate", 400)
+raise HTTPException(status_code=400, detail="Jailbreak detected")
+history = [{"role": "user", "parts": [f"Target: {target}\nRequest: {prompt}"]}]
+atlas_output = generate_project(history)
+if not atlas_output:
+audit_log(ip, key_hash, "/generate", 500)
+raise HTTPException(status_code=500, detail="AI generation failed")
+files = atlas_output.files
+files = validate_assets(files) # FIXED: call asset validator
+ok, msg = run_all_validators(files)
+if not ok:
+audit_log(ip, key_hash, "/generate", 400)
+raise HTTPException(status_code=400, detail=f"Validation Failed: {msg}")
+temp_dir = Path(tempfile.mkdtemp())
+ok, msg = sandbox_test(files, temp_dir)
+shutil.rmtree(temp_dir)
+if not ok:
+audit_log(ip, key_hash, "/generate", 400)
+raise HTTPException(status_code=400, detail=f"Sandbox Runtime Fail: {msg}")
+save_project_files(project_id, files)
+audit_log(ip, key_hash, "/generate", 200)
+return {"project_id": project_id, "readme": atlas_output.readme, "files": [f.path for f in files]}
+
+@app.post("/v1/projects/{project_id}/build")
+def api_build(project_id: str, request: Request = None, x_api_key: str = Header(...)):
+key_hash = verify_api_key_dep(x_api_key)
+ip = get_client_ip(request)
+if not check_rate_limit(f"{ip}_build", RATE_LIMIT_BUILD):
+audit_log(ip, key_hash, "/build", 429)
+raise HTTPException(status_code=429, detail="Rate limit exceeded")
+if is_project_locked(project_id):
+audit_log(ip, key_hash, "/build", 409)
+raise HTTPException(status_code=409, detail="Project already locked")
+files = load_project_files(project_id)
+if not files:
+audit_log(ip, key_hash, "/build", 404)
+raise HTTPException(status_code=404, detail="Project not found")
+if not any(f.path == "main.py" for f in files):
+audit_log(ip, key_hash, "/build", 400)
+raise HTTPException(status_code=400, detail="No main.py")
+task_id = str(uuid.uuid4())
+write_task_state(task_id, "queued", "Queued for build", project_id)
+executor.submit(github_push_tree_task, task_id, files, GITHUB_REPO, GITHUB_TOKEN, project_id)
+audit_log(ip, key_hash, "/build", 200)
+return {"task_id": task_id}
+
+@app.get("/v1/tasks/{task_id}")
+def api_task_status(task_id: str, x_api_key: str = Header(...)):
+verify_api_key_dep(x_api_key)
+return read_task_state(task_id)
+
+==================== STREAMLIT ====================
+
+def run_streamlit():
+st.set_page_config(page_title="OmniForge v7.3 Titan Hardened", layout="wide")
+if "project_id" not in st.session_state: st.session_state.project_id = str(uuid.uuid4())
+if "history" not in st.session_state: st.session_state.history = []
+if "current_task_id" not in st.session_state: st.session_state.current_task_id = None
+
+files = load_project_files(st.session_state.project_id)  
+st.title("⚡ OmniForge v7.3 Titan Hardened")  
+
+with st.sidebar:  
+    st.title("⚡ Titan Control")  
+    target = st.selectbox("Force Platform", ["Auto-Best", "Kivy", "Flutter", "FastAPI", "Streamlit"])  
+    mode = st.radio("Mode", ["Build", "Continue", "Auto-Fix Error"])  
+    if st.button("🗑️ New Project"):  
+        st.session_state.project_id = str(uuid.uuid4())  
+        st.session_state.history = []  
+        st.rerun()  
+    st.caption("v7.3: All critical bugs fixed.")  
+
+for msg in st.session_state.history:  
+    with st.chat_message(msg["role"]): st.markdown(msg["content"])  
+
+if prompt := st.chat_input("Describe app or paste error log..."):  
+    if is_project_locked(st.session_state.project_id):  
+        st.error("Project is locked (build in progress). Wait for build to finish.")  
+        st.stop()  
+    if is_jailbreak(prompt):  
+        st.error("Request blocked: Prompt injection detected.")  
+        st.stop()  
+    st.session_state.history.append({"role": "user", "content": prompt})  
+    with st.chat_message("user"): st.markdown(prompt)  
+    try:  
+        with st.spinner("Atlas forging..."):  
+            history = compress_history([{"role": m["role"], "parts": [m["content"]]} for m in st.session_state.history])  
+            atlas_output = generate_project(history)  
+            if not atlas_output:  
+                st.error("Atlas Error: Failed to generate valid JSON after 1 retry.")  
+                st.stop()  
+            new_files = atlas_output.files  
+            if target == "Kivy" or any(f.path == "main.py" for f in files + new_files):  
+                if not any(f.path == ".github/workflows/build.yml" for f in files + new_files):  
+                    new_files.append(AtlasFile
